@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+httpx
+pydub
+SpeechRecognition
+rapidfuzz
+python-multipart
