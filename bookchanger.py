@@ -27,11 +27,15 @@
 # explain *why* several of these functions are written the way they are.
 #
 # WHAT'S NEW (added after the marker): DTMF menu support (main.py is 100%
-# voice-driven and never reads a keypress), api_add_N-based path/token
-# resolution instead of a plain `token` param, name-spacing autocorrection,
-# Israeli phone validation, ini-line parsing that's tolerant of the
-# Name=Phone / Phone=Name inconsistency seen in the sample data, and INI
-# add/remove/replace helpers.
+# voice-driven and never reads a keypress), ini path/token resolution via
+# ext.ini's api_add_0/api_add_1 -- see resolve_ini_path_and_token()'s
+# docstring: YHM unpacks api_add_N=paramName=value into an actual request
+# parameter named paramName, so this reads `ini_path`/`token` directly
+# (matching the paired ext.ini files), with the old literal api_add_N scan
+# kept only as a defensive fallback -- name-spacing autocorrection, Israeli
+# phone validation, ini-line parsing that's tolerant of the Name=Phone /
+# Phone=Name inconsistency seen in the sample data, and INI add/remove/
+# replace helpers.
 #
 # ⚠️ ONE FLAGGED ASSUMPTION: build_digit_read() constructs the `read=`
 # response directive used for every DTMF menu (Main Menu, and every
@@ -687,7 +691,20 @@ def get_play_path(ext: str, base_name: str) -> str:
     return f"/{ext}/{base_name}" if ext else f"/{base_name}"
 
 
-# ─── api_add_N resolution (path + token arrive dynamically, not as `token`) ─
+# ─── Path + token resolution ────────────────────────────────────────────────
+# CORRECTED after checking real ext.ini examples from the YHM developer
+# community: api_add_N is a config-file-only device for working around
+# ini's "no duplicate keys" limitation. Its VALUE is itself "paramName=
+# paramValue", and YHM unpacks that before calling the webhook -- so
+# `api_add_0=ini_path=ListAllInformation.ini` in ext.ini results in your
+# webhook receiving an actual parameter named `ini_path`, NOT one literally
+# named `api_add_0`. (Confirmed independently across three unrelated forum
+# examples doing exactly this to pass a Gemini key/token/path trio, an
+# ini-file token/action/path trio, and a queue token/path/say_tts trio to
+# their own webhooks.) This file's ext.ini uses `ini_path` and `token` as
+# the chosen parameter names, so that's what's read directly below; the old
+# literal api_add_0/api_add_1 scan is kept only as a defensive fallback in
+# case a particular setup ever surfaces them unparsed.
 
 def _scan_api_add_params(params: dict) -> list[str]:
     values = []
@@ -700,19 +717,21 @@ def _scan_api_add_params(params: dict) -> list[str]:
 
 def resolve_ini_path_and_token(params: dict) -> tuple[str, str]:
     """
-    Per the spec, the target ini path and the YHM token arrive as api_add_N
-    request parameters (how YHM attaches fixed extra parameters to every
-    call made to an api extension) rather than as a `token` param the way
-    main.py reads it directly.
+    Primary path: read the `ini_path` / `token` parameters directly -- what
+    YHM actually sends once it unpacks this file's ext.ini
+    `api_add_0=ini_path=...` / `api_add_1=token=...` directives.
 
-    Position isn't assumed blindly: a value that looks like a file path
-    (contains '/' or ends in '.ini') is treated as the ini path; whichever
-    remaining value doesn't look like a path is treated as the token. If
-    that heuristic can't confidently separate them (e.g. only one api_add_N
-    is actually configured, or neither/both look path-like), this falls
-    back to the spec's own suggested convention: api_add_0=path,
-    api_add_1=token.
+    Fallback, only if either of those came back empty: scan literal
+    api_add_N values and guess which is which by shape (a value containing
+    '/' or ending '.ini' is the path; whichever other value doesn't look
+    path-like is the token) -- defensive in case some setup passes them
+    unparsed rather than via the paramName=paramValue convention above.
     """
+    ini_path = params.get("ini_path", "").strip()
+    token = params.get("token", "").strip()
+    if ini_path and token:
+        return ini_path, token
+
     values = _scan_api_add_params(params)
 
     def looks_like_path(v: str) -> bool:
@@ -721,12 +740,18 @@ def resolve_ini_path_and_token(params: dict) -> tuple[str, str]:
     path_candidates = [v for v in values if looks_like_path(v)]
     other_candidates = [v for v in values if not looks_like_path(v)]
 
-    if path_candidates and other_candidates:
-        return path_candidates[0], other_candidates[0]
+    if not ini_path:
+        if path_candidates:
+            ini_path = path_candidates[0]
+        elif values:
+            ini_path = values[0]
+    if not token:
+        if other_candidates:
+            token = other_candidates[0]
+        elif len(values) > 1:
+            token = values[1]
 
-    path = values[0] if len(values) > 0 else ""
-    token = values[1] if len(values) > 1 else ""
-    return path, token
+    return ini_path, token
 
 
 def resolve_ini_full_path(raw_path: str, ext: str) -> str:
@@ -1244,14 +1269,9 @@ async def yemot_ivr(request: Request):
     api_extension = params.get("ApiExtension", "").strip()
 
     ini_raw_path, token = resolve_ini_path_and_token(params)
-    if not token:
-        # Fallback for setups that also/instead pass a plain `token` param
-        # (e.g. if it's ever added as a standard YHM parameter rather than
-        # via api_add_N).
-        token = params.get("token", "").strip()
 
     if not token:
-        logger.error("Could not resolve a YHM token from api_add_* params (or `token`).")
+        logger.error("Could not resolve a YHM token from `token` (or a fallback api_add_* scan).")
         return PlainTextResponse("id_list_message=t-שגיאה בטוקן")
     if not api_phone:
         logger.error("Missing ApiPhone parameter.")
