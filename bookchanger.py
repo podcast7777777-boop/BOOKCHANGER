@@ -89,6 +89,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════════════════
+# CHANGELOG — Live-call hangup fix (v1.6.0 -> v1.7.0)
+# ═══════════════════════════════════════════════════════════════════════════
+# Bug #5 — Caller disconnected ~1 second after connecting (M1607)
+#   Root cause (confirmed via Render request logs + the official
+#   id_list_message docs): every spoken prompt in this file contained the
+#   characters '.' and '-', which the docs explicitly forbid ("לא להכניס
+#   בטקסט את התווים נקודה וקו מפריד"). The dot is YHM's segment separator
+#   between t-/s-/f- directives, so a menu prompt like "הקישו 1. למחיקה
+#   הקישו 2." was split into several segments with no valid type prefix,
+#   the whole response was rejected as invalid, YHM played M1607 "אין מענה
+#   משרת API" and dropped the caller immediately.
+#   Fix applied:
+#     - New sanitize_tts_text() replaces '.' with ", " and '-' with " " in
+#       every spoken text, and is applied in build_digit_read() and
+#       ask_record() — the only two places in the file where text is embedded
+#       into a response — so prompts can be authored naturally with
+#       punctuation while this stays a one-place fix. The intentional dots
+#       that separate *directives* in multi-segment responses (t-...s-...)
+#       are untouched.
+# ═══════════════════════════════════════════════════════════════════════════
 # CHANGELOG — Production Bug-fix Refactor (v1.5.0 -> v1.6.0)
 # ═══════════════════════════════════════════════════════════════════════════
 # Bug #1 — Confirmation word ("Yes"/"No") erroneously recorded as the target name
@@ -171,7 +191,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="bookchanger.py — YHM Phonebook Manager",
     description="ניהול ספר טלפונים קולי/הקשות עבור מערכות ימות המשיח",
-    version="1.0.0"
+    version="1.7.0"
 )
 
 # ─── Robust Environment Variable Parsing ──────────────────────────────────────
@@ -766,7 +786,13 @@ def resolve_ini_full_path(raw_path: str, ext: str) -> str:
     raw_path = raw_path.strip()
     if raw_path.startswith("ivr2:"):
         return raw_path
-    return get_yhm_path(ext, raw_path.lstrip("/"))
+    if raw_path.startswith("/"):
+        # Root-relative path (e.g. "/3/2/ListAllInformation.ini"): resolve
+        # from the IVR root, not from the calling extension's folder.
+        # Without this, a leading "/" was silently stripped and the path
+        # was re-rooted under the calling extension ("ivr2:/3/6/3/2/...").
+        return f"ivr2:{raw_path}"
+    return get_yhm_path(ext, raw_path)
 
 
 # ─── Shared "capture the latest recording" pipeline ─────────────────────────
@@ -1073,6 +1099,19 @@ async def cleanup_temp_files(
 
 # ─── DTMF digit-read directive (see the ⚠️ note at the top of this file) ────
 
+def sanitize_tts_text(text: str) -> str:
+    """
+    YHM's id_list_message docs forbid the period ('.') and dash ('-')
+    characters in spoken text: the dot is the segment separator between
+    t-/s-/f- directives, and a stray one makes the whole response invalid
+    (YHM plays M1607 "אין מענה משרת API" and drops the call immediately --
+    the exact symptom seen in the Render logs). Applied to every prompt
+    text before it's embedded in a response, so prompts can be authored
+    naturally (with punctuation) while this stays a one-place fix.
+    """
+    return text.replace(". ", ", ").replace(".", ", ").replace("-", " ")
+
+
 def build_digit_read(prompt_text: str, param_name: str, max_digits: int = 1, min_digits: int = 1) -> str:
     """
     Builds the 'read' fragment of a YHM API response, asking the caller to
@@ -1085,7 +1124,7 @@ def build_digit_read(prompt_text: str, param_name: str, max_digits: int = 1, min
     stays a one-place edit instead of a search-and-replace across every
     state.
     """
-    return f"read=t-{prompt_text}={param_name},tap,{max_digits},{min_digits}"
+    return f"read=t-{sanitize_tts_text(prompt_text)}={param_name},tap,{max_digits},{min_digits}"
 
 
 # ─── Response-building helpers (ask-and-route / ask-and-read patterns) ─────
@@ -1100,7 +1139,7 @@ async def ask_record(
     saved = await save_caller_state(ext, safe_phone, api_call_id, next_state, "", token)
     if not saved:
         return PlainTextResponse("id_list_message=t-שגיאה פנימית במערכת אנא נסה שוב")
-    return PlainTextResponse(f"id_list_message=t-{prompt_text}&go_to_folder={routing_path}")
+    return PlainTextResponse(f"id_list_message=t-{sanitize_tts_text(prompt_text)}&go_to_folder={routing_path}")
 
 
 async def ask_voice_confirm(
@@ -1263,6 +1302,15 @@ async def yemot_ivr(request: Request):
                 exc, exc_info=True
             )
     params = {**query_params, **form_params}
+
+    # YHM reports the caller hanging up with a final request carrying
+    # `hangup=yes`. That's a notification, not a live interaction -- answer
+    # it immediately without touching state files or playing any prompt
+    # (previously the code replayed the menu and wrote state for a call
+    # that was already dead).
+    if params.get("hangup", "").strip().lower() == "yes":
+        logger.info("Hangup notification for call %s -- ignoring.", params.get("ApiCallId", ""))
+        return PlainTextResponse("")
 
     api_phone = params.get("ApiPhone", "").strip()
     api_call_id = params.get("ApiCallId", "").strip()
