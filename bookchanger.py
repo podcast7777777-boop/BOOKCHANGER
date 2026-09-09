@@ -6,8 +6,10 @@
 # ------------
 # A `type=api` webhook that lets a caller add, delete, or edit entries in an
 # INI phonebook (Name=Phone) entirely by phone: a DTMF main menu, voice
-# recording + Google STT for names/phone numbers, and voice or DTMF
-# confirmation, depending on the step. State is stateless-HTTP-safe: it is
+# recording + Google STT for NAMES, and DTMF keypad entry for PHONE NUMBERS.
+# Every confirmation in the system is DTMF (1 = approve / 2 = re-enter):
+# names via ask_dtmf_confirm's own read= directive, keyed phone numbers via
+# YHM's built-in approve/re-enter menu. State is stateless-HTTP-safe: it is
 # NOT kept in memory or on local disk (Render's filesystem doesn't persist
 # across requests/deploys) -- it lives entirely on the YHM server itself, as
 # small .tts text files addressed by phone number, read/written through the
@@ -37,24 +39,24 @@
 # Phone=Name inconsistency seen in the sample data, and INI add/remove/
 # replace helpers.
 #
-# ⚠️ ONE FLAGGED ASSUMPTION: build_digit_read() constructs the `read=`
-# response directive used for every DTMF menu (Main Menu, and every
-# "press 1/2/3" in Delete/Edit). main.py has no precedent for this -- every
-# input in it is a voice recording -- so this syntax is a best-effort guess
-# from community documentation, not something proven against a real call
-# yet. Every DTMF prompt in this file goes through that one function, so if
-# the digit doesn't come back the way it's expected to on your first real
-# test call, that's the one place to fix.
+# build_digit_read() constructs the `read=` response directive used for
+# every DTMF prompt (Main Menu, every "press 1/2/3" in Delete/Edit, and the
+# keyed phone-number entry via build_phone_entry_read). The syntax follows
+# the official YHM API module docs (read=<prompt>=param,useExisting,maxDigits,
+# minDigits,...). Every DTMF prompt in this file goes through that one
+# function, so if a digit ever comes back unexpectedly on a real call,
+# that's the one place to fix.
 #
 # STATE MAP
 # ---------
 #   1      Main Menu: ask (plays menu, reads 1 digit)
 #   2      Main Menu: process digit -> 11 / 21 / 31
-#   11-14  Add:    record name -> confirm -> record phone -> confirm -> save
+#   11-13  Add:    record name -> confirm by keypad (1=approve / 2=re-record)
+#                  -> KEY the phone (built-in approve/re-enter menu) -> save
 #   21-22  Delete: record search name -> found menu (delete/search again/menu)
-#   31-38  Edit:   record search name -> found menu -> name keep-or-new
-#                  (-> record/confirm new name) -> phone keep-or-new
-#                  (-> record/confirm new phone) -> save
+#   31-37  Edit:   record search name -> found menu -> name keep-or-new
+#                  (-> record new name -> confirm by keypad) -> phone
+#                  keep-or-new (-> KEY the new phone) -> save
 # Every state number is "the state that will process whatever the caller
 # does next", exactly like main.py's own State 1/2/3/4 -- see main.py's Bug
 # #2 changelog note on _reset_to_name_recording for why resets always jump
@@ -89,25 +91,59 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CHANGELOG — Live-call hangup fix (v1.6.0 -> v1.7.0)
+# CHANGELOG — v1.7.0 -> v1.8.0: confirmations by DTMF instead of voice
 # ═══════════════════════════════════════════════════════════════════════════
-# Bug #5 — Caller disconnected ~1 second after connecting (M1607)
-#   Root cause (confirmed via Render request logs + the official
-#   id_list_message docs): every spoken prompt in this file contained the
-#   characters '.' and '-', which the docs explicitly forbid ("לא להכניס
-#   בטקסט את התווים נקודה וקו מפריד"). The dot is YHM's segment separator
-#   between t-/s-/f- directives, so a menu prompt like "הקישו 1. למחיקה
-#   הקישו 2." was split into several segments with no valid type prefix,
-#   the whole response was rejected as invalid, YHM played M1607 "אין מענה
-#   משרת API" and dropped the caller immediately.
-#   Fix applied:
-#     - New sanitize_tts_text() replaces '.' with ", " and '-' with " " in
-#       every spoken text, and is applied in build_digit_read() and
-#       ask_record() — the only two places in the file where text is embedded
-#       into a response — so prompts can be authored naturally with
-#       punctuation while this stays a one-place fix. The intentional dots
-#       that separate *directives* in multi-segment responses (t-...s-...)
-#       are untouched.
+# The recorded "כן/לא" confirmation is gone -- the caller now confirms every
+# step by keypad (1 = approve / 2 = re-enter):
+#   - ask_voice_confirm/redo_voice_confirm replaced by ask_dtmf_confirm/
+#     replay_dtmf_confirm: the recognized name is still played back from its
+#     {tts_key}_{phone}.tts file, but instead of routing to the recording
+#     sub-folder for a spoken yes/no, the same response carries a documented
+#     read= directive collecting ONE digit into {tts_key}_key. States 12
+#     (Add) and 35 (Edit) are now plain DTMF-menu states: "1" approves,
+#     "2" re-records the name, anything else replays the confirm without
+#     discarding the field.
+#   - State 12's handoff to the phone step changed from routing to the
+#     recording folder to the inline keyed-phone read= (v1.7.0's mechanism).
+#   - Removed with the voice-confirm flow: evaluate_confirmation,
+#     process_confirm_recording, fuzzy_match, and the confirm_cutoff
+#     parameter (no longer read). CONFIRM_/PHONE_ prefixes stay in
+#     cleanup_temp_files' list so legacy files from older deployments are
+#     still purged on reset.
+#   - Net effect for the caller: after saying a name they hear it back and
+#     press 1 to approve or 2 to say it again -- no recording of a spoken
+#     confirmation, no STT round-trip on the confirm step.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CHANGELOG — v1.6.0 -> v1.7.0: phone entry by DTMF instead of voice
+# ═══════════════════════════════════════════════════════════════════════════
+# The caller now KEYS phone numbers on the keypad instead of recording them
+# aloud (names are still voice + Google STT). What changed:
+#   - Add flow: old States 13+14 (record phone -> confirm yes/no) merged
+#     into a single State 13. Edit flow: old States 37+38 merged into a
+#     single State 37. The new number is collected inline by a documented
+#     YHM `read=` directive using the built-in `Phone` input type, which
+#     accepts only a valid Israeli number (9 digits starting 02/03/04/08/09
+#     or 10 digits starting 05/07), speaks the keyed digits back digit by
+#     digit, and then plays YHM's own "לאישור הקישו אחת, להקשה מחודשת הקישו
+#     שתיים" menu -- so capture AND confirmation happen inside that one
+#     read=, with re-entry handled by YHM ("2" comes back as the value and
+#     simply replays the prompt). No trip to the recording sub-folder, no
+#     WAV handling, no STT, no CONFIRM/PHONE/NEWPHONE temp files on this
+#     path.
+#   - build_digit_read() rewritten to the official documented schema
+#     (read=<prompt>=param,useExisting,maxDigits,minDigits,...): the old
+#     "param,tap,max,min" form was exactly the ⚠️ unproven syntax the file
+#     header used to flag, and is NOT part of the documented schema. All
+#     existing DTMF menus route through that one function, so this also
+#     resolves the header's flagged assumption.
+#   - Python-side normalize_and_validate_phone kept on the keyed path as a
+#     defense-in-depth net (an unexpected value can never reach the ini).
+#   - State map and flow comments updated accordingly; 1_ext.ini is still
+#     required -- names remain voice-recorded.
+# ═══════════════════════════════════════════════════════════════════════════
+
 # ═══════════════════════════════════════════════════════════════════════════
 # CHANGELOG — Production Bug-fix Refactor (v1.5.0 -> v1.6.0)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -191,7 +227,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="bookchanger.py — YHM Phonebook Manager",
     description="ניהול ספר טלפונים קולי/הקשות עבור מערכות ימות המשיח",
-    version="1.7.0"
+    version="1.8.0"
 )
 
 # ─── Robust Environment Variable Parsing ──────────────────────────────────────
@@ -219,27 +255,16 @@ def get_yhm_path(ext: str, file_name: str) -> str:
     return f"ivr2:/{file_name}"
 
 
-# ─── פונקציות עזר: התאמה מקורבת (מילת אישור בודדת מול "כן"/"לא") ─────────────
-
-def fuzzy_match(s1: str, s2: str) -> float:
-    """
-    יחס דמיון ברמת-תו על המחרוזת השלמה. נשאר בשימוש עבור בדיקת מילות
-    אישור/שלילה קצרות וידועות מראש (State 3) — שם השוואת-תו רגילה עדיין
-    מתאימה היטב, בניגוד לחיפוש שמות (ראה Bug #4 ו-compute_name_match_score
-    למטה, המיועד במפורש לבעיית החיפוש החלקי/הרב-מילתי).
-    """
-    str1 = s1.lower().strip()
-    str2 = s2.lower().strip()
-    if HAS_RAPIDFUZZ:
-        return float(fuzz.ratio(str1, str2))
-    return difflib.SequenceMatcher(None, str1, str2).ratio() * 100.0
-
-
 # ─── BUG #4 FIX: התאמת שמות ברמת-מילה (token-level) ──────────────────────────
-# הבעיה המקורית: fuzzy_match לעיל משתמש ביחס-דמיון ברמת-תו על המחרוזת כולה.
-# יחס כזה מוטה חזק על ידי הפרש-אורכים, ולכן חיפוש חלקי כמו "הבר" מול המועמד
-# הארוך "מאיר יהודה הבר" מקבל ציון נמוך (נמדד בפועל: ~35%), הרבה מתחת לכל סף
-# (cutoff) סביר -- זה בדיוק התיאור בדוח התקלה. הפתרון: להשוות ברמת קבוצת-מילים.
+# הערה: main.py הגדיר כאן גם את fuzzy_match (יחס-דמיון ברמת-תו על מחרוזת שלמה)
+# עבור מילות אישור/שלילה קוליות קצרות ("כן"/"לא"). הוא הוסר יחד עם זרימת ה-
+# אישור הקולי: ב-bookchanger.py כל האישורים מתבצעים בהקשות (1 = אישור /
+# 2 = הקלטה מחודשת) -- בין ב-read= של ask_dtmf_confirm ובין בתפריט המובנה של
+# ימות בהקשת מספר הטלפון. ההערה ההיסטורית להלן נשארת על המקור של הבאג:
+# יחס-דמיון ברמת-תו על המחרוזת כולה (כפי ש-fuzzy_match היה עושה) מוטה חזק
+# על ידי הפרש-אורכים, ולכן חיפוש חלקי כמו "הבר" מול המועמד הארוך "מאיר יהודה
+# הבר" מקבל ציון נמוך (נמדד בפועל: ~35%), הרבה מתחת לכל סף (cutoff) סביר --
+# זה בדיוק התיאור בדוח התקלה. הפתרון: להשוות ברמת קבוצת-מילים.
 
 _PUNCTUATION_PATTERN = re.compile(r"[\"'\u05F3\u05F4\-.,;:()\[\]{}]+")
 
@@ -327,7 +352,7 @@ def compute_name_match_score(target: str, candidate: str) -> float:
 
 def parse_percentage_param(raw_value: str | None, default: float) -> float:
     """
-    BUG #4 FIX: פענוח עמיד של פרמטר סף (cutoff / confirm_cutoff) שמגיע מה-HTTP
+    BUG #4 FIX: פענוח עמיד של פרמטר סף (cutoff) שמגיע מה-HTTP
     request (query params או form data), ללא קשר לאופן שבו ext.ini/הבקשה שולחים
     אותו בפועל:
       - תומך בפורמטים כמו "80", "0.8", " 80 ", "80%", "80,5" (פסיק כנקודה עשרונית).
@@ -839,46 +864,16 @@ async def capture_latest_recording(ext: str, token: str) -> tuple[str, str] | No
     return recognized_text, filename
 
 
-# ─── Shared voice-confirmation logic (extracted from main.py's State 3) ─────
-
-def evaluate_confirmation(confirm_text: str, confirm_cutoff: float) -> bool:
-    """
-    Identical scoring logic to main.py's State 3 Bug #2 fix: an explicit
-    negative match (>= cutoff AND >= the positive score) always wins, so a
-    clear "no" is never accidentally treated as confirmation just because
-    it also scores a few points of incidental similarity to "yes".
-    """
-    approval_options = ["כן", "כ", "כן כן", "מאשר", "מאשרת"]
-    negative_options = ["לא", "טעות", "מחדש", "לא מאשר"]
-    positive_score = max(fuzzy_match(confirm_text, opt) for opt in approval_options)
-    negative_score = max(fuzzy_match(confirm_text, opt) for opt in negative_options)
-    is_explicit_negative = negative_score >= confirm_cutoff and negative_score >= positive_score
-    return (positive_score >= confirm_cutoff) and not is_explicit_negative
-
-
-async def process_confirm_recording(
-    ext: str, safe_phone: str, token: str, params: dict
-) -> tuple[bool, str] | None:
-    """
-    Downloads+STTs a yes/no confirmation recording, writes it to
-    CONFIRM_{phone}.tts (kept for parity with main.py, useful for
-    debugging), and scores it. Returns (is_confirmed, confirm_text), or
-    None if there was no usable recording at all -- callers should treat
-    None the way main.py's State 3 treats a too-short confirmation: replay
-    the SAME confirm prompt rather than resetting the whole step.
-    """
-    captured = await capture_latest_recording(ext, token)
-    if not captured:
-        return None
-    confirm_text, _ = captured
-    confirm_path = get_yhm_path(ext, f"CONFIRM_{safe_phone}.tts")
-    await yhm_write_text_file(confirm_path, confirm_text, token)
-    confirm_cutoff = parse_percentage_param(params.get("confirm_cutoff"), default=60.0)
-    is_confirmed = evaluate_confirmation(confirm_text, confirm_cutoff)
-    return is_confirmed, confirm_text
-
-
 # ─── Name spacing autocorrection ────────────────────────────────────────────
+# NOTE: main.py's shared voice yes/no confirmation (State 3's scoring of a
+# recorded "כן/לא" -- evaluate_confirmation + process_confirm_recording in
+# the previous version of this file) is gone entirely: every confirmation
+# in bookchanger.py is DTMF now (1 = approve / 2 = re-enter), either via
+# ask_dtmf_confirm's own read= or YHM's built-in approve/re-enter menu on
+# the keyed phone step. `confirm_cutoff` is therefore no longer read.
+
+
+
 
 _LETTER_DIGIT_BOUNDARY = re.compile(r"(?<=[^\s\d])(?=\d)|(?<=\d)(?=[^\s\d])")
 
@@ -1118,13 +1113,98 @@ def build_digit_read(prompt_text: str, param_name: str, max_digits: int = 1, min
     press digits and attaching the result to the *next* request under
     `param_name`.
 
-    ⚠️ SYNTAX NOT PROVEN AGAINST A REAL CALL — see the file header. Every
-    DTMF prompt in this file calls this one function rather than building
-    read= strings inline, specifically so a syntax correction (if needed)
-    stays a one-place edit instead of a search-and-replace across every
-    state.
+    Uses the schema documented in YHM's official API module docs (f2.freeivr
+    topic 56, "read" section -- previously this was an unproven guess; the
+    'tap' type this function used to emit is NOT part of the documented
+    schema):
+
+        read=<prompt>=<paramName>,<useExisting>,<maxDigits>,<minDigits>,
+             <waitSeconds>,<sayAsFormat>,<blockStar>,<blockZero>,...
+
+    Here only the first four data fields are set: useExisting=no (always
+    collect fresh input), then max/min digits; the rest fall back to YHM's
+    defaults (7s wait, NO spoken playback of what was keyed). Every DTMF
+    prompt in this file calls this one function rather than building read=
+    strings inline, so any future correction stays a one-place edit.
     """
-    return f"read=t-{sanitize_tts_text(prompt_text)}={param_name},tap,{max_digits},{min_digits}"
+    return f"read=t-{sanitize_tts_text(prompt_text)}={param_name},no,{max_digits},{min_digits}"
+
+
+# ─── Keyed phone-number entry (DTMF instead of voice recording) ─────────────
+
+_PHONE_ENTRY_PROMPT = (
+    "אנא הקישו את מספר הטלפון. לאישור הקישו אחת, להקשה מחודשת הקישו שתיים"
+)
+
+
+def build_phone_entry_read(param_name: str) -> str:
+    """
+    The documented `read=` directive that collects a *keyed* phone number.
+
+    Uses YHM's built-in `Phone` input type (same official schema as
+    build_digit_read, with the say-format field set):
+      - accepts only a valid Israeli number (9 digits starting 02/03/04/08/09,
+        or 10 digits starting 05/07),
+      - speaks the keyed digits back digit-by-digit,
+      - then plays YHM's built-in menu "לאישור הקישו אחת, להקשה מחודשת
+        הקישו שתיים" -- so re-entry, and the yes/no style confirmation the
+        old voice flow needed, are handled by YHM itself without any extra
+        state or recording.
+    `param_name` receives exactly the digits (or the re-entry key "2").
+    """
+    return f"read=t-{sanitize_tts_text(_PHONE_ENTRY_PROMPT)}={param_name},no,10,9,7,Phone"
+
+
+async def ask_phone_entry(
+    ext: str, safe_phone: str, api_call_id: str, token: str, next_state: int
+) -> PlainTextResponse:
+    """
+    Shared "key the phone number" step for Add (State 13) and Edit (State
+    37): saves the state that will process the keyed digits, then returns
+    the read= directive. No routing to the recording sub-folder happens on
+    this path -- YHM collects the digits inline and re-calls the webhook.
+    """
+    saved = await save_caller_state(ext, safe_phone, api_call_id, next_state, "", token)
+    if not saved:
+        return PlainTextResponse("id_list_message=t-שגיאה פנימית במערכת אנא נסה שוב")
+    return PlainTextResponse(build_phone_entry_read("phone_entry"))
+
+
+async def process_keyed_phone(
+    ext: str, safe_phone: str, api_call_id: str, token: str, params: dict, state: int
+) -> str | PlainTextResponse:
+    """
+    Processes what YHM sends back after the built-in approve/re-enter menu:
+      - "2" means the caller asked to re-key the number -> replay the read=
+        step (same state).
+      - Anything else is the digits themselves. YHM's Phone input type
+        already rejected malformed numbers, and the approve menu means a
+        confirmed number -- this one state therefore replaces what used to
+        be two separate capture + voice-confirm states.
+
+    Returns the validated digit string on success, or a PlainTextResponse
+    (a re-key prompt) when the caller chose to re-enter or the Python-side
+    validation -- kept as a defense-in-depth safety net so an unexpected
+    input shape can never be written into the ini -- rejects the value.
+    Caller contract: `if isinstance(result, PlainTextResponse): return result`.
+    """
+    raw = params.get("phone_entry", "").strip()
+    digits = _PHONE_DIGITS_ONLY.sub("", raw)
+
+    if digits == "2":
+        logger.info("State %d: caller chose to re-key the phone number.", state)
+        return await ask_phone_entry(ext, safe_phone, api_call_id, token, state)
+
+    valid_phone = normalize_and_validate_phone(digits)
+    if not valid_phone:
+        logger.info(
+            "State %d: keyed input '%s' failed the Python-side validation -- "
+            "asking to key again (YHM's Phone type should normally prevent this).",
+            state, raw,
+        )
+        return await ask_phone_entry(ext, safe_phone, api_call_id, token, state)
+
+    return valid_phone
 
 
 # ─── Response-building helpers (ask-and-route / ask-and-read patterns) ─────
@@ -1142,18 +1222,23 @@ async def ask_record(
     return PlainTextResponse(f"id_list_message=t-{sanitize_tts_text(prompt_text)}&go_to_folder={routing_path}")
 
 
-async def ask_voice_confirm(
-    ext: str, safe_phone: str, api_call_id: str, token: str, routing_path: str,
+async def ask_dtmf_confirm(
+    ext: str, safe_phone: str, api_call_id: str, token: str,
     tts_key: str, recognized_text: str, next_state: int
 ) -> PlainTextResponse:
     """
-    Writes `recognized_text` to `{tts_key}_{phone}.tts` and plays it back
-    (via a safe 's-' file reference, not interpolated directly into the
-    response text -- see the note on ask_menu_with_announcement below)
-    followed by "do you confirm?", then routes to the recording sub-folder
-    for a yes/no answer. Used for NAME/PHONE (Add) and NEWNAME/NEWPHONE
-    (Edit) -- the exact State-2-style pattern main.py uses for its own name
-    confirmation, generalized to four different fields.
+    Writes `recognized_text` to `{tts_key}_{phone}.tts`, plays it back (via
+    a safe 's-' file reference, not interpolated directly into the response
+    text -- see the note on ask_menu_with_announcement below) followed by
+    the approve/re-record menu, then reads ONE digit via a documented read=
+    directive. The webhook is re-called with `{tts_key.lower()}_key` --
+    lowercased to match how States 12/35 read the digit (and how every
+    other read= param in this file is named):
+      "1" = approve  -> the caller moves on to `next_state`'s handler
+      "2" = re-record the same field
+      anything else  -> the confirm step replays (field not discarded)
+    Used for NAME (Add, State 12) and NEWNAME (Edit, State 35). The caller
+    no longer has to record a spoken "כן/לא" -- confirmation is DTMF.
     """
     tts_path = get_yhm_path(ext, f"{tts_key}_{safe_phone}.tts")
     await yhm_write_text_file(tts_path, recognized_text, token)
@@ -1163,22 +1248,35 @@ async def ask_voice_confirm(
     if not saved:
         return PlainTextResponse("id_list_message=t-שגיאה פנימית במערכת אנא נסה שוב")
 
+    confirm_prompt = (
+        "האם אתה מאשר את השם. לאישור הקישו אחת, "
+        "להקלטה מחודשת הקישו שתיים"
+    )
+    key_param = f"{tts_key.lower()}_key"
     return PlainTextResponse(
-        f"id_list_message=s-{play_path}.t-האם אתה מאשר&go_to_folder={routing_path}"
+        f"id_list_message=s-{play_path}&{build_digit_read(confirm_prompt, key_param)}"
     )
 
 
-async def redo_voice_confirm(
+async def replay_dtmf_confirm(
     ext: str, safe_phone: str, api_call_id: str, token: str,
-    routing_path: str, tts_key: str, same_state: int
+    tts_key: str, same_state: int
 ) -> PlainTextResponse:
-    """Replays the same confirm prompt without resetting the field -- same
-    behavior as main.py's State 3 when the confirmation recording itself is
-    missing/too short (stays on State 3, doesn't discard the name)."""
+    """
+    Replays the same DTMF confirm (announcement + 1-digit read=) without
+    resetting the field -- the DTMF analogue of main.py's State 3 staying
+    on State 3 when its confirmation recording was missing/too short.
+    Reached when the digit wasn't 1 (approve) or 2 (re-record).
+    """
     play_path = get_play_path(ext, f"{tts_key}_{safe_phone}")
     await save_caller_state(ext, safe_phone, api_call_id, same_state, "", token)
+    confirm_prompt = (
+        "בחירה לא תקינה. האם אתה מאשר את השם. לאישור הקישו אחת, "
+        "להקלטה מחודשת הקישו שתיים"
+    )
+    key_param = f"{tts_key.lower()}_key"
     return PlainTextResponse(
-        f"id_list_message=t-דיבור לא ברור.s-{play_path}.t-האם אתה מאשר&go_to_folder={routing_path}"
+        f"id_list_message=s-{play_path}&{build_digit_read(confirm_prompt, key_param)}"
     )
 
 
@@ -1395,8 +1493,10 @@ async def yemot_ivr(request: Request):
             return await ask_main_menu(ext, safe_phone, api_call_id, token, prefix="בחירה לא תקינה")
 
     # ═══════════════════════════════════════════════════════════════════
-    # ADD FLOW (States 11-14): record name -> confirm -> record phone ->
-    # confirm -> append to ini
+    # ADD FLOW (States 11-13): record name -> confirm by keypad (1=approve
+    # / 2=re-record) -> KEY the phone -> append to ini (the phone step is
+    # DTMF entry with YHM's built-in approve/re-enter menu, not a recording
+    # -- see build_phone_entry_read)
     # ═══════════════════════════════════════════════════════════════════
     elif current_state == 11:
         captured = await capture_latest_recording(ext, token)
@@ -1408,87 +1508,62 @@ async def yemot_ivr(request: Request):
         recognized_text, _ = captured
         corrected_name = autocorrect_name_spacing(recognized_text)
         logger.info("State 11: recognized name '%s' -> corrected '%s'", recognized_text, corrected_name)
-        return await ask_voice_confirm(
-            ext, safe_phone, api_call_id, token, routing_path,
+        return await ask_dtmf_confirm(
+            ext, safe_phone, api_call_id, token,
             "NAME", corrected_name, 12
         )
 
     elif current_state == 12:
-        result = await process_confirm_recording(ext, safe_phone, token, params)
-        if result is None:
-            return await redo_voice_confirm(ext, safe_phone, api_call_id, token, routing_path, "NAME", 12)
+        # The name confirmation is now DTMF: 1 = approve, 2 = re-record.
+        digit = params.get("name_key", "").strip()
+        logger.info("State 12: name confirm digit: '%s'", digit)
 
-        is_confirmed, _ = result
-        if not is_confirmed:
+        if digit == "1":  # approved -> move on to the KEYED phone step
+            name_path = get_yhm_path(ext, f"NAME_{safe_phone}.tts")
+            confirmed_name = await yhm_read_text_file(name_path, token)
+            if not confirmed_name:
+                logger.error("State 12: NAME_%s.tts missing after confirmation.", safe_phone)
+                await cleanup_temp_files(ext, safe_phone, token, ["NAME_"])
+                return await ask_record(
+                    ext, safe_phone, api_call_id, token, routing_path,
+                    "אנא אמרו את השם להוספה", 11
+                )
+
+            ini_content = await yhm_read_text_file(ini_path, token) or ""
+            if find_existing_entry_by_name(ini_content, confirmed_name):
+                logger.info("State 12: '%s' already exists. Asking for a different name.", confirmed_name)
+                await cleanup_temp_files(ext, safe_phone, token, ["NAME_"])
+                return await ask_record(
+                    ext, safe_phone, api_call_id, token, routing_path,
+                    "השם הזה כבר קיים ברשימה. אנא אמרו שם אחר", 11
+                )
+
+            return await ask_phone_entry(ext, safe_phone, api_call_id, token, 13)
+
+        elif digit == "2":  # re-record the name
             logger.info("State 12: name not confirmed. Resetting to name recording.")
-            await cleanup_temp_files(ext, safe_phone, token, ["NAME_", "CONFIRM_"])
+            await cleanup_temp_files(ext, safe_phone, token, ["NAME_"])
             return await ask_record(
                 ext, safe_phone, api_call_id, token, routing_path,
                 "אנא אמרו את השם להוספה", 11
             )
 
-        name_path = get_yhm_path(ext, f"NAME_{safe_phone}.tts")
-        confirmed_name = await yhm_read_text_file(name_path, token)
-        if not confirmed_name:
-            logger.error("State 12: NAME_%s.tts missing after confirmation.", safe_phone)
-            return await ask_record(
-                ext, safe_phone, api_call_id, token, routing_path,
-                "אנא אמרו את השם להוספה", 11
-            )
-
-        ini_content = await yhm_read_text_file(ini_path, token) or ""
-        if find_existing_entry_by_name(ini_content, confirmed_name):
-            logger.info("State 12: '%s' already exists. Asking for a different name.", confirmed_name)
-            await cleanup_temp_files(ext, safe_phone, token, ["NAME_", "CONFIRM_"])
-            return await ask_record(
-                ext, safe_phone, api_call_id, token, routing_path,
-                "השם הזה כבר קיים ברשימה. אנא אמרו שם אחר", 11
-            )
-
-        return await ask_record(
-            ext, safe_phone, api_call_id, token, routing_path,
-            "אנא אמרו את מספר הטלפון להוספה", 13
-        )
+        else:
+            return await replay_dtmf_confirm(ext, safe_phone, api_call_id, token, "NAME", 12)
 
     elif current_state == 13:
-        captured = await capture_latest_recording(ext, token)
-        if not captured:
-            return await ask_record(
-                ext, safe_phone, api_call_id, token, routing_path,
-                "דיבור לא ברור. אנא אמרו את מספר הטלפון להוספה", 13
-            )
-        recognized_text, _ = captured
-        valid_phone = normalize_and_validate_phone(recognized_text)
-        if not valid_phone:
-            logger.info("State 13: '%s' did not validate as an Israeli phone number.", recognized_text)
-            return await ask_record(
-                ext, safe_phone, api_call_id, token, routing_path,
-                "מספר הטלפון שנקלט אינו תקין. אנא אמרו את מספר הטלפון להוספה", 13
-            )
-        return await ask_voice_confirm(
-            ext, safe_phone, api_call_id, token, routing_path,
-            "PHONE", valid_phone, 14
-        )
-
-    elif current_state == 14:
-        result = await process_confirm_recording(ext, safe_phone, token, params)
-        if result is None:
-            return await redo_voice_confirm(ext, safe_phone, api_call_id, token, routing_path, "PHONE", 14)
-
-        is_confirmed, _ = result
-        if not is_confirmed:
-            logger.info("State 14: phone not confirmed. Re-recording phone only.")
-            await cleanup_temp_files(ext, safe_phone, token, ["PHONE_", "CONFIRM_"])
-            return await ask_record(
-                ext, safe_phone, api_call_id, token, routing_path,
-                "אנא אמרו את מספר הטלפון להוספה", 13
-            )
+        # Phone step: the caller KEYS the number (DTMF) and YHM itself
+        # speaks the digits back and offers approve (1) / re-enter (2)
+        # before the webhook is re-called -- so this one state replaces
+        # the old capture (13) + voice-confirm (14) pair.
+        result = await process_keyed_phone(ext, safe_phone, api_call_id, token, params, 13)
+        if isinstance(result, PlainTextResponse):
+            return result
+        valid_phone = result
 
         final_name = await yhm_read_text_file(get_yhm_path(ext, f"NAME_{safe_phone}.tts"), token)
-        final_phone = await yhm_read_text_file(get_yhm_path(ext, f"PHONE_{safe_phone}.tts"), token)
-
-        if not final_name or not final_phone:
-            logger.error("State 14: missing NAME/PHONE temp files at final save (phone=%s).", safe_phone)
+        if not final_name:
+            logger.error("State 13: NAME_%s.tts missing at final save (phone=%s).", safe_phone)
             await cleanup_temp_files(ext, safe_phone, token)
             return await ask_main_menu(ext, safe_phone, api_call_id, token, prefix="אירעה שגיאה, אנא נסו שוב")
 
@@ -1502,14 +1577,14 @@ async def yemot_ivr(request: Request):
                 "השם הזה כבר קיים ברשימה. אנא אמרו שם אחר", 11
             )
 
-        new_content = add_ini_entry(ini_content, final_name, final_phone)
+        new_content = add_ini_entry(ini_content, final_name, valid_phone)
         write_success = await yhm_write_text_file(ini_path, new_content, token)
         if not write_success:
-            logger.error("State 14: failed to write updated ini to %s", ini_path)
+            logger.error("State 13: failed to write updated ini to %s", ini_path)
             await cleanup_temp_files(ext, safe_phone, token)
             return await ask_main_menu(ext, safe_phone, api_call_id, token, prefix="שמירת הרשומה נכשלה")
 
-        logger.info("State 14: added '%s=%s' to %s", final_name, final_phone, ini_path)
+        logger.info("State 13: added '%s=%s' to %s", final_name, valid_phone, ini_path)
         await cleanup_temp_files(ext, safe_phone, token)
         return await ask_main_menu(ext, safe_phone, api_call_id, token, prefix="הרשומה נוספה בהצלחה")
 
@@ -1599,8 +1674,10 @@ async def yemot_ivr(request: Request):
             return await ask_main_menu(ext, safe_phone, api_call_id, token)
 
     # ═══════════════════════════════════════════════════════════════════
-    # EDIT FLOW (States 31-38): record search name -> found menu ->
-    # name keep-or-new -> phone keep-or-new -> save
+    # EDIT FLOW (States 31-37): record search name -> found menu ->
+    # name keep-or-new (-> record new name -> confirm by keypad) ->
+    # phone keep-or-new (-> KEY the new phone, with YHM's built-in
+    # approve/re-enter menu) -> save
     # ═══════════════════════════════════════════════════════════════════
     elif current_state == 31:
         captured = await capture_latest_recording(ext, token)
@@ -1680,7 +1757,7 @@ async def yemot_ivr(request: Request):
         if digit == "1":  # keep current name -> move on to the phone step
             current_phone = await yhm_read_text_file(get_yhm_path(ext, f"CURRENT_PHONE_{safe_phone}.tts"), token) or ""
             announce = f"מספר הטלפון הנוכחי הוא {current_phone}"
-            menu_text = "להשארת המספר הקישו 1. להקלטת מספר חדש הקישו 2"
+            menu_text = "להשארת המספר הקישו 1. להקשת מספר חדש הקישו 2"
             return await ask_menu_with_announcement(
                 ext, safe_phone, api_call_id, token, announce, menu_text, "edit_key3", 36
             )
@@ -1706,51 +1783,54 @@ async def yemot_ivr(request: Request):
             )
         recognized_text, _ = captured
         corrected_name = autocorrect_name_spacing(recognized_text)
-        return await ask_voice_confirm(
-            ext, safe_phone, api_call_id, token, routing_path,
+        return await ask_dtmf_confirm(
+            ext, safe_phone, api_call_id, token,
             "NEWNAME", corrected_name, 35
         )
 
     elif current_state == 35:
-        result = await process_confirm_recording(ext, safe_phone, token, params)
-        if result is None:
-            return await redo_voice_confirm(ext, safe_phone, api_call_id, token, routing_path, "NEWNAME", 35)
+        # The new-name confirmation is now DTMF: 1 = approve, 2 = re-record.
+        digit = params.get("newname_key", "").strip()
+        logger.info("State 35: new-name confirm digit: '%s'", digit)
 
-        is_confirmed, _ = result
-        if not is_confirmed:
-            await cleanup_temp_files(ext, safe_phone, token, ["NEWNAME_", "CONFIRM_"])
+        if digit == "1":  # approved -> keep going with the edit
+            new_name = await yhm_read_text_file(get_yhm_path(ext, f"NEWNAME_{safe_phone}.tts"), token)
+            if not new_name:
+                logger.error("State 35: NEWNAME_%s.tts missing after confirmation.", safe_phone)
+                return await ask_record(
+                    ext, safe_phone, api_call_id, token, routing_path,
+                    "אנא הקליטו את השם החדש", 34
+                )
+
+            # Duplicate check against every OTHER entry -- not against the
+            # record currently being edited itself.
+            ini_content = await yhm_read_text_file(ini_path, token) or ""
+            original_name = await yhm_read_text_file(get_yhm_path(ext, f"ORIGINAL_NAME_{safe_phone}.tts"), token) or ""
+            existing = find_existing_entry_by_name(ini_content, new_name)
+            if existing and normalize_name_for_comparison(new_name) != normalize_name_for_comparison(original_name):
+                await cleanup_temp_files(ext, safe_phone, token, ["NEWNAME_"])
+                return await ask_record(
+                    ext, safe_phone, api_call_id, token, routing_path,
+                    "השם הזה כבר קיים ברשימה. אנא הקליטו שם אחר", 34
+                )
+
+            await yhm_write_text_file(get_yhm_path(ext, f"CURRENT_NAME_{safe_phone}.tts"), new_name, token)
+            current_phone = await yhm_read_text_file(get_yhm_path(ext, f"CURRENT_PHONE_{safe_phone}.tts"), token) or ""
+            announce = f"מספר הטלפון הנוכחי הוא {current_phone}"
+            menu_text = "להשארת המספר הקישו 1. להקשת מספר חדש הקישו 2"
+            return await ask_menu_with_announcement(
+                ext, safe_phone, api_call_id, token, announce, menu_text, "edit_key3", 36
+            )
+
+        elif digit == "2":  # re-record the new name
+            await cleanup_temp_files(ext, safe_phone, token, ["NEWNAME_"])
             return await ask_record(
                 ext, safe_phone, api_call_id, token, routing_path,
                 "אנא הקליטו את השם החדש", 34
             )
 
-        new_name = await yhm_read_text_file(get_yhm_path(ext, f"NEWNAME_{safe_phone}.tts"), token)
-        if not new_name:
-            logger.error("State 35: NEWNAME_%s.tts missing after confirmation.", safe_phone)
-            return await ask_record(
-                ext, safe_phone, api_call_id, token, routing_path,
-                "אנא הקליטו את השם החדש", 34
-            )
-
-        # Duplicate check against every OTHER entry -- not against the
-        # record currently being edited itself.
-        ini_content = await yhm_read_text_file(ini_path, token) or ""
-        original_name = await yhm_read_text_file(get_yhm_path(ext, f"ORIGINAL_NAME_{safe_phone}.tts"), token) or ""
-        existing = find_existing_entry_by_name(ini_content, new_name)
-        if existing and normalize_name_for_comparison(new_name) != normalize_name_for_comparison(original_name):
-            await cleanup_temp_files(ext, safe_phone, token, ["NEWNAME_", "CONFIRM_"])
-            return await ask_record(
-                ext, safe_phone, api_call_id, token, routing_path,
-                "השם הזה כבר קיים ברשימה. אנא הקליטו שם אחר", 34
-            )
-
-        await yhm_write_text_file(get_yhm_path(ext, f"CURRENT_NAME_{safe_phone}.tts"), new_name, token)
-        current_phone = await yhm_read_text_file(get_yhm_path(ext, f"CURRENT_PHONE_{safe_phone}.tts"), token) or ""
-        announce = f"מספר הטלפון הנוכחי הוא {current_phone}"
-        menu_text = "להשארת המספר הקישו 1. להקלטת מספר חדש הקישו 2"
-        return await ask_menu_with_announcement(
-            ext, safe_phone, api_call_id, token, announce, menu_text, "edit_key3", 36
-        )
+        else:
+            return await replay_dtmf_confirm(ext, safe_phone, api_call_id, token, "NEWNAME", 35)
 
     elif current_state == 36:
         digit = params.get("edit_key3", "").strip()
@@ -1759,57 +1839,26 @@ async def yemot_ivr(request: Request):
         if digit == "1":  # keep current phone -> both fields resolved, save now
             return await finalize_edit(ext, safe_phone, api_call_id, token, ini_path)
         elif digit == "2":
-            return await ask_record(
-                ext, safe_phone, api_call_id, token, routing_path,
-                "אנא אמרו את מספר הטלפון החדש", 37
-            )
+            # New phone is now KEYED (DTMF), not recorded -- route through
+            # the read= phone-entry step instead of the recording folder.
+            return await ask_phone_entry(ext, safe_phone, api_call_id, token, 37)
         else:
             current_phone = await yhm_read_text_file(get_yhm_path(ext, f"CURRENT_PHONE_{safe_phone}.tts"), token) or ""
             announce = f"מספר הטלפון הנוכחי הוא {current_phone}"
-            menu_text = "בחירה לא תקינה. להשארת המספר הקישו 1. להקלטת מספר חדש הקישו 2"
+            menu_text = "בחירה לא תקינה. להשארת המספר הקישו 1. להקשת מספר חדש הקישו 2"
             return await ask_menu_with_announcement(
                 ext, safe_phone, api_call_id, token, announce, menu_text, "edit_key3", 36
             )
 
     elif current_state == 37:
-        captured = await capture_latest_recording(ext, token)
-        if not captured:
-            return await ask_record(
-                ext, safe_phone, api_call_id, token, routing_path,
-                "דיבור לא ברור. אנא אמרו את מספר הטלפון החדש", 37
-            )
-        recognized_text, _ = captured
-        valid_phone = normalize_and_validate_phone(recognized_text)
-        if not valid_phone:
-            return await ask_record(
-                ext, safe_phone, api_call_id, token, routing_path,
-                "מספר הטלפון שנקלט אינו תקין. אנא אמרו את מספר הטלפון החדש", 37
-            )
-        return await ask_voice_confirm(
-            ext, safe_phone, api_call_id, token, routing_path,
-            "NEWPHONE", valid_phone, 38
-        )
-
-    elif current_state == 38:
-        result = await process_confirm_recording(ext, safe_phone, token, params)
-        if result is None:
-            return await redo_voice_confirm(ext, safe_phone, api_call_id, token, routing_path, "NEWPHONE", 38)
-
-        is_confirmed, _ = result
-        if not is_confirmed:
-            await cleanup_temp_files(ext, safe_phone, token, ["NEWPHONE_", "CONFIRM_"])
-            return await ask_record(
-                ext, safe_phone, api_call_id, token, routing_path,
-                "אנא אמרו את מספר הטלפון החדש", 37
-            )
-
-        new_phone = await yhm_read_text_file(get_yhm_path(ext, f"NEWPHONE_{safe_phone}.tts"), token)
-        if not new_phone:
-            logger.error("State 38: NEWPHONE_%s.tts missing after confirmation.", safe_phone)
-            return await ask_record(
-                ext, safe_phone, api_call_id, token, routing_path,
-                "אנא אמרו את מספר הטלפון החדש", 37
-            )
+        # New-phone step for Edit: the caller KEYS the number (DTMF) and
+        # YHM itself speaks the digits back and offers approve (1) /
+        # re-enter (2) before the webhook is re-called -- one state
+        # replaces the old capture (37) + voice-confirm (38) pair.
+        result = await process_keyed_phone(ext, safe_phone, api_call_id, token, params, 37)
+        if isinstance(result, PlainTextResponse):
+            return result
+        new_phone = result
 
         await yhm_write_text_file(get_yhm_path(ext, f"CURRENT_PHONE_{safe_phone}.tts"), new_phone, token)
         return await finalize_edit(ext, safe_phone, api_call_id, token, ini_path)
@@ -1828,4 +1877,4 @@ async def yemot_ivr(request: Request):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "engine": "FastAPI bookchanger.py — YHM Phonebook Manager v1.0.0"}
+    return {"status": "ok", "engine": "FastAPI bookchanger.py — YHM Phonebook Manager v1.8.0"}

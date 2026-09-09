@@ -1,0 +1,15 @@
+# YHM extension configs carry the real API token — never commit them
+ext.ini
+1_ext.ini
+1/
+
+# Local scratch
+temp.txt
+new.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# Local pip target dirs used for offline test installs
+.test-deps/
